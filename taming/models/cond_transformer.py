@@ -18,17 +18,17 @@ class Net2NetTransformer(pl.LightningModule):
                  transformer_config,
                  first_stage_config,
                  cond_stage_config,
-                 permuter_config=None,
-                 ckpt_path=None,
+                 permuter_config=None, # Configuration for a permutation module
+                 ckpt_path=None, # Path to a checkpoint file for initializing the model weights
                  ignore_keys=[],
                  first_stage_key="image",
                  cond_stage_key="depth",
                  downsample_cond_size=-1,
-                 pkeep=1.0,
-                 sos_token=0,
+                 pkeep=1.0, # Probability for keeping certain elements
+                 sos_token=0, # Start-of-sequence token
                  unconditional=False,
                  ):
-        super().__init__()
+        super().__init__() # Calls the LightningModule's __init__
         self.be_unconditional = unconditional
         self.sos_token = sos_token
         self.first_stage_key = first_stage_key
@@ -45,6 +45,7 @@ class Net2NetTransformer(pl.LightningModule):
         self.downsample_cond_size = downsample_cond_size
         self.pkeep = pkeep
 
+    # initialize a PyTorch model from a checkpoint file
     def init_from_ckpt(self, path, ignore_keys=list()):
         sd = torch.load(path, map_location="cpu")["state_dict"]
         for k in sd.keys():
@@ -79,24 +80,31 @@ class Net2NetTransformer(pl.LightningModule):
 
     def forward(self, x, c):
         # one step to produce the logits
-        _, z_indices = self.encode_to_z(x)
-        _, c_indices = self.encode_to_c(c)
+        _, z_indices = self.encode_to_z(x) # original image
+        _, c_indices = self.encode_to_c(c) # conditional image
 
         if self.training and self.pkeep < 1.0:
+            # https://en.wikipedia.org/wiki/Bernoulli_distribution
+            # generates a tensor of the same shape as z_indices
+            # where each element is independently drawn from a Bernoulli distribution with a probability of self.pkeep
+            # if self.pkeep is 0.9, there's a 90% chance that each element will be kept
             mask = torch.bernoulli(self.pkeep*torch.ones(z_indices.shape,
                                                          device=z_indices.device))
+            # convert to 0 and 1, tensor is of type torch.int64
             mask = mask.round().to(dtype=torch.int64)
+            # Creates a tensor of the same shape as z_indices, filled with random integers.
             r_indices = torch.randint_like(z_indices, self.transformer.config.vocab_size)
             a_indices = mask*z_indices+(1-mask)*r_indices
         else:
             a_indices = z_indices
-
+        # concatenation layer
         cz_indices = torch.cat((c_indices, a_indices), dim=1)
 
         # target includes all sequence elements (no need to handle first one
         # differently because we are conditioning)
         target = z_indices
         # make the prediction
+        # Generates predictions from the transformer model, excluding the last element of the sequence.
         logits, _ = self.transformer(cz_indices[:, :-1])
         # cut off conditioning outputs - output i corresponds to p(z_i | z_{<i}, c)
         logits = logits[:, c_indices.shape[1]-1:]
@@ -109,12 +117,13 @@ class Net2NetTransformer(pl.LightningModule):
         out[out < v[..., [-1]]] = -float('Inf')
         return out
 
-    @torch.no_grad()
+    @torch.no_grad() # Disables gradient tracking for the code inside the method
     def sample(self, x, c, steps, temperature=1.0, sample=False, top_k=None,
                callback=lambda k: None):
         x = torch.cat((c,x),dim=1)
         block_size = self.transformer.get_block_size()
         assert not self.transformer.training
+        # input is pure noise
         if self.pkeep <= 0.0:
             # one pass suffices since input is pure noise anyway
             assert len(x.shape)==2
@@ -273,8 +282,10 @@ class Net2NetTransformer(pl.LightningModule):
 
     def get_input(self, key, batch):
         x = batch[key]
+        # If x has the shape (N, H, W), it will be reshaped to (N, H, W, 1)
         if len(x.shape) == 3:
             x = x[..., None]
+        # Reorders the dimensions of 4D tensors from (N, H, W, C) to (N, C, H, W)
         if len(x.shape) == 4:
             x = x.permute(0, 3, 1, 2).to(memory_format=torch.contiguous_format)
         if x.dtype == torch.double:
@@ -288,13 +299,20 @@ class Net2NetTransformer(pl.LightningModule):
             x = x[:N]
             c = c[:N]
         return x, c
-
+    
+    # The .reshape(-1, logits.size(-1)) operation ensures that the tensor has the shape (N*H*W, C), 
+    # where N is the batch size, H and W are spatial dimensions, and C is the number of classes.
+    # Flattens the target tensor to have shape (N*H*W,)
     def shared_step(self, batch, batch_idx):
         x, c = self.get_xc(batch)
         logits, target = self(x, c)
         loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), target.reshape(-1))
         return loss
 
+    # prog_bar: Displays the metric in the progress bar during training
+    # logger: Logs the metric to the training logs
+    # on_step: Logs the metric at every training step.
+    # on_epoch: Logs the metric at the end of every epoch
     def training_step(self, batch, batch_idx):
         loss = self.shared_step(batch, batch_idx)
         self.log("train/loss", loss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
@@ -349,4 +367,4 @@ class Net2NetTransformer(pl.LightningModule):
             {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
         ]
         optimizer = torch.optim.AdamW(optim_groups, lr=self.learning_rate, betas=(0.9, 0.95))
-        return optimizer
+        return optimizer##
